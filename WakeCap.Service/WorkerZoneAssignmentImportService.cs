@@ -7,7 +7,6 @@ using WakeCap.DAL.Repositories.Interfaces;
 using WakeCap.Models.Enums;
 using WakeCap.Service.Interfaces;
 
-
 namespace WakeCap.Service;
 
 public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository workerZoneAssignmentRepository, IWorkerRepository workerRepository, IZoneRepository zoneRepository, IUploadLogRepository uploadLogRepository) : IWorkerZoneAssignmentImportService
@@ -17,19 +16,31 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
 
     public async Task<AssignmentImportResult> ImportWorkerZoneAssignmentsAsync(Stream fileStream, string fileName)
     {
+        Console.WriteLine("Starting import process...");
+
         var rows = ReadCsvRows(fileStream);
+        Console.WriteLine($"Read {rows.Count} rows from CSV.");
+
         if (rows.Count > MaxRows)
         {
+            Console.WriteLine("Error: File exceeds maximum row limit.");
             throw new InvalidOperationException($"File exceeds maximum row limit of {MaxRows}");
         }
 
         var (uniqueWorkerCodes, uniqueZoneCodes, assignmentKeys, rowOccurrences, workerDateZones) = CollectDataFromRows(rows);
+        Console.WriteLine($"Collected unique worker codes: {uniqueWorkerCodes.Count}, zone codes: {uniqueZoneCodes.Count}.");
 
         var existingWorkerCodesAndIds = await workerRepository.GetWorkerCodesAndIdsAsync(uniqueWorkerCodes);
+        Console.WriteLine($"Fetched {existingWorkerCodesAndIds.Count} existing worker codes from DB.");
+
         var existingZoneCodesAndIds = await zoneRepository.GetZoneCodesAndIdsAsync(uniqueZoneCodes);
+        Console.WriteLine($"Fetched {existingZoneCodesAndIds.Count} existing zone codes from DB.");
+
         var existingAssignments = await workerZoneAssignmentRepository.GetExistingAssignmentsAsync(assignmentKeys);
+        Console.WriteLine($"Fetched {existingAssignments.Count} existing assignments from DB.");
 
         var result = ValidateRows(rows, existingWorkerCodesAndIds, existingZoneCodesAndIds, existingAssignments, rowOccurrences, workerDateZones);
+        Console.WriteLine($"Validation completed. Valid rows: {result.ValidRows.Count}, Errors: {result.Errors.Count}");
 
         if (!result.Errors.Any())
         {
@@ -41,6 +52,11 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
             }).ToList();
 
             await workerZoneAssignmentRepository.BulkInsertAssignmentsAsync(assignments);
+            Console.WriteLine($"Bulk inserted {assignments.Count} new assignments.");
+        }
+        else
+        {
+            Console.WriteLine("Errors found. Skipping insert.");
         }
 
         await uploadLogRepository.SaveLogAsync(new UploadLog
@@ -51,28 +67,32 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
             ErrorRows = result.Errors.Count,
             Status = result.Errors.Any() ? UploadStatus.rejected.ToString() : UploadStatus.saved.ToString()
         });
+        Console.WriteLine("Upload log saved.");
 
         return result;
     }
 
     private List<BulkUploadDto> ReadCsvRows(Stream fileStream)
     {
+        Console.WriteLine("Reading CSV rows...");
         using var reader = new StreamReader(fileStream);
         using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
         csv.Context.TypeConverterOptionsCache.GetOptions<string>().NullValues.Add(string.Empty);
         csv.Read();
         csv.ReadHeader();
-        return csv.GetRecords<BulkUploadDto>().ToList();
+        var records = csv.GetRecords<BulkUploadDto>().ToList();
+        Console.WriteLine($"CSV parsing complete. Total rows parsed: {records.Count}");
+        return records;
     }
 
     private static (HashSet<string> uniqueWorkerCodes,
-        HashSet<string> uniqueZoneCodes, 
-        HashSet<(string, DateTime)> assignmentKeys, 
-        Dictionary<(string, string, string), int> rowOccurrences, 
-        Dictionary<(string, DateTime), 
-        HashSet<string>> workerDateZones)
+        HashSet<string> uniqueZoneCodes,
+        HashSet<(string, DateTime)> assignmentKeys,
+        Dictionary<(string, string, string), int> rowOccurrences,
+        Dictionary<(string, DateTime), HashSet<string>> workerDateZones)
         CollectDataFromRows(List<BulkUploadDto> rows)
     {
+        Console.WriteLine("Collecting data from rows...");
         var uniqueWorkerCodes = new HashSet<string>();
         var uniqueZoneCodes = new HashSet<string>();
         var assignmentKeys = new HashSet<(string, DateTime)>();
@@ -96,9 +116,7 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
                     assignmentKeys.Add(key);
 
                     if (!workerDateZones.ContainsKey(key))
-                    {
                         workerDateZones[key] = new HashSet<string>();
-                    }
 
                     workerDateZones[key].Add(zoneCode);
                 }
@@ -107,6 +125,8 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
             var rowKey = (workerCode, zoneCode, assignmentDate);
             rowOccurrences[rowKey] = rowOccurrences.GetValueOrDefault(rowKey) + 1;
         }
+
+        Console.WriteLine("Data collection from rows complete.");
         return (uniqueWorkerCodes, uniqueZoneCodes, assignmentKeys, rowOccurrences, workerDateZones);
     }
 
@@ -118,6 +138,7 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
         Dictionary<(string, string, string), int> rowOccurrences,
         Dictionary<(string, DateTime), HashSet<string>> workerDateZones)
     {
+        Console.WriteLine("Validating rows...");
         var result = new AssignmentImportResult();
         var multipleZoneKeys = workerDateZones
             .Where(kv => kv.Value.Count > 1)
@@ -134,38 +155,30 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
             };
             var rowErrors = new RowError { Data = rowData, Error = new Dictionary<string, string>() };
 
-            // Validate worker code
             ValidateWorkerCode(existingWorkerCodesAndIds, row, rowErrors);
-
-            // Validate zone code
             ValidateZoneCode(existingZoneCodesAndIds, row, rowErrors);
-
-            // Validate assignment date if in valid format or not
 
             if (!DateTime.TryParse(row.AssignmentDate, out DateTime assignmentDate))
             {
                 AddError(rowErrors, "assignment_date", "Invalid date format");
             }
 
-            // Check for exact duplicates in the file
             var rowKey = (row.WorkerCode, row.ZoneCode, row.AssignmentDate);
             if (rowOccurrences.TryGetValue(rowKey, out int count) && count > 1)
                 AddError(rowErrors, "rowError", "Duplicate row in file");
 
-            // Check for multiple zone assignments in the file
             if (assignmentDate.Date > DateTime.MinValue.Date)
             {
                 var assignmentKey = (row.WorkerCode, assignmentDate);
                 if (multipleZoneKeys.Contains(assignmentKey))
                     AddError(rowErrors, "rowError", "Worker assigned to multiple zones on the same date");
 
-                // Check for conflicts with existing assignments
                 if (existingAssignments.TryGetValue(assignmentKey, out var existingZoneCode))
                 {
                     if (existingZoneCode == row.ZoneCode)
                         AddError(rowErrors, "rowError", "Assignment already exists in worker_zone_assignment table");
                     else
-                        AddError(rowErrors, "rowError", "If inserted, it would create a conflicting assignment for the same worker on the same date");
+                        AddError(rowErrors, "rowError", "Conflicting assignment for the same worker on the same date");
                 }
             }
 
@@ -174,9 +187,12 @@ public class WorkerZoneAssignmentImportService(IWorkerZoneAssignmentRepository w
             else
                 result.ValidRows.Add(row);
         }
+
         result.ErrorRowsCount = result.Errors.Count;
         result.ValidRowsCount = result.ValidRows.Count;
         result.TotalRowsCount = rows.Count;
+
+        Console.WriteLine("Validation complete.");
         return result;
     }
 
